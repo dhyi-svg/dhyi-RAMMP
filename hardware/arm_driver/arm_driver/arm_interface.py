@@ -539,7 +539,7 @@ class KinovaArm:
             waypoint = waypoints.waypoints.add()
             waypoint.name = "waypoint_" + str(index)
             waypoint.angular_waypoint.angles.extend(jointPose)
-            waypoint.angular_waypoint.duration = 0.5
+            waypoint.angular_waypoint.duration = 5.0
             index = index + 1
 
         with self._lock:

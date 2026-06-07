@@ -2,9 +2,15 @@
 """
 Bottle detector node for RAMMP demo.
 
-Uses YOLO segmentation + depth image (not point cloud) for 3D localization.
+Uses YOLO segmentation + depth image for 3D localization.
 Mirrors the approach used in last year's button_detector.py for efficiency
 on the Jetson Orin Nano.
+
+Partial detection handling:
+  - If the bottle mask touches the bottom of the frame, the bottle extends
+    further down than detected. The centroid is shifted down proportionally
+    based on how much of the bottle is estimated to be out of frame.
+  - If the mask touches any other border, the detection is rejected.
 
 Lifecycle:
   - On launch: initialize subscribers, publishers, TF. YOLO not loaded yet.
@@ -40,9 +46,11 @@ import torch
 from ultralytics import YOLO
 from realsense2_camera_msgs.msg import Extrinsics
 
-# TODO: set model path before running
 MODEL_PATH = '/home/cailyns/yolo11n-seg.pt'
 CONF_THRESHOLD = 0.25
+
+# How many pixels from the border counts as "touching"
+BORDER_MARGIN_PX = 5
 
 
 def depth_to_meters(depth_cv: np.ndarray) -> np.ndarray:
@@ -124,43 +132,26 @@ class BottleDetector(Node):
 
         self.create_service(SetBool, '/arm/bottle/detection/enable', self._srv_detection_enable)
 
-        # RGB and depth subscriptions
         self.create_subscription(
-            Image,
-            self.get_parameter('rgb_topic').value,
-            self._cb_rgb,
-            qos_profile_sensor_data,
+            Image, self.get_parameter('rgb_topic').value, self._cb_rgb, qos_profile_sensor_data
         )
         self.create_subscription(
-            Image,
-            self.get_parameter('depth_topic').value,
-            self._cb_depth,
-            qos_profile_sensor_data,
+            Image, self.get_parameter('depth_topic').value, self._cb_depth, qos_profile_sensor_data
         )
         self.create_subscription(
-            CameraInfo,
-            self.get_parameter('color_info_topic').value,
-            self._cb_color_info,
-            10,
+            CameraInfo, self.get_parameter('color_info_topic').value, self._cb_color_info, 10
         )
         self.create_subscription(
-            CameraInfo,
-            self.get_parameter('depth_info_topic').value,
-            self._cb_depth_info,
-            10,
+            CameraInfo, self.get_parameter('depth_info_topic').value, self._cb_depth_info, 10
         )
 
         qos_extr = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
+            history=HistoryPolicy.KEEP_LAST, depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.create_subscription(
-            Extrinsics,
-            self.get_parameter('extrinsics_topic').value,
-            self._cb_extrinsics,
-            qos_extr,
+            Extrinsics, self.get_parameter('extrinsics_topic').value, self._cb_extrinsics, qos_extr
         )
 
         rate = float(self.get_parameter('process_rate_hz').value)
@@ -253,8 +244,13 @@ class BottleDetector(Node):
     # ── YOLO ──────────────────────────────────────────────────────────────────
 
     def _run_yolo(self, img):
+        """Run YOLO and return (mask, bbox, conf, bottom_cut_fraction).
+
+        bottom_cut_fraction: fraction of bottle estimated to be below frame (0.0 = fully visible).
+        Returns (None, None, None, 0.0) if no valid detection.
+        """
         if self.yolo is None:
-            return None, None, None
+            return None, None, None, 0.0
         try:
             results = self.yolo(
                 img,
@@ -264,16 +260,19 @@ class BottleDetector(Node):
             )
         except Exception as e:
             self.get_logger().debug(f'YOLO failed: {e}')
-            return None, None, None
+            return None, None, None, 0.0
 
         n = len(results[0].boxes) if results[0].boxes is not None else 0
-        self.get_logger().info(f'YOLO: {n} detections, classes: {results[0].boxes.cls.tolist() if results[0].boxes is not None else []}')
+        self.get_logger().info(
+            f'YOLO: {n} detections, classes: '
+            f'{results[0].boxes.cls.tolist() if results[0].boxes is not None else []}'
+        )
 
         if not results or results[0].masks is None:
-            return None, None, None
+            return None, None, None, 0.0
         r = results[0]
         if len(r.boxes) == 0:
-            return None, None, None
+            return None, None, None, 0.0
 
         best = r.boxes.conf.argmax().item()
         mask_poly = r.masks.xy[best]
@@ -283,15 +282,45 @@ class BottleDetector(Node):
         h, w = img.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
         cv2.fillPoly(mask, [mask_poly.astype(np.int32)], 255)
-        return mask, bbox, conf_val
+
+        # Check which borders the mask touches
+        touches_top    = mask[:BORDER_MARGIN_PX, :].any()
+        touches_left   = mask[:, :BORDER_MARGIN_PX].any()
+        touches_right  = mask[:, -BORDER_MARGIN_PX:].any()
+        touches_bottom = mask[-BORDER_MARGIN_PX:, :].any()
+
+        # Reject if touches top, left, or right — can't estimate correction
+        if touches_top or touches_left or touches_right:
+            self.get_logger().debug('Rejecting partial detection (touches top/left/right border)')
+            return None, None, None, 0.0
+
+        # If touches bottom, estimate how much of the bottle is below frame
+        bottom_cut_fraction = 0.0
+        if touches_bottom:
+            mask_rows = np.where(mask.any(axis=1))[0]
+            if len(mask_rows) > 0:
+                mask_top_px    = float(mask_rows[0])
+                mask_bottom_px = float(mask_rows[-1])
+                visible_height = mask_bottom_px - mask_top_px
+
+                if visible_height > 0:
+                    # Assume bottle is symmetric — estimate true bottom by mirroring
+                    # the visible portion below the detected bottom
+                    mask_center_px = (mask_top_px + mask_bottom_px) / 2.0
+                    estimated_true_bottom = 2.0 * mask_bottom_px - mask_top_px
+                    pixels_below = max(0.0, estimated_true_bottom - (h - 1))
+                    estimated_true_height = visible_height + pixels_below
+                    bottom_cut_fraction = pixels_below / estimated_true_height
+                    self.get_logger().info(
+                        f'Partial bottom detection: {bottom_cut_fraction:.2f} of bottle below frame'
+                    )
+
+        return mask, bbox, conf_val, bottom_cut_fraction
 
     # ── 3D from depth image ────────────────────────────────────────────────────
 
     def _get_centroid_from_depth(self, mask, bbox):
-        """Get 3D centroid using depth image + camera intrinsics.
-
-        Mirrors button_detector.py approach — much faster than point cloud.
-        """
+        """Get 3D centroid using depth image + camera intrinsics."""
         if self.color_info is None or self.depth_info is None or self.depth_to_color_extr is None:
             self.get_logger().debug('Missing camera info or extrinsics')
             return None
@@ -317,7 +346,6 @@ class BottleDetector(Node):
         stride = max(1, int(self.get_parameter('depth_stride').value))
         min_pts = int(self.get_parameter('min_mask_points').value)
 
-        # Restrict to bbox region with margin
         x1, y1, x2, y2 = bbox.astype(np.float32)
         margin = 20
         fx_ratio = fx_d / fx_c if fx_c > 0 else 1.0
@@ -333,23 +361,18 @@ class BottleDetector(Node):
                 z = float(depth_m[v, u])
                 if not (min_z < z < max_z):
                     continue
-
-                # Project depth pixel to color frame
                 Xd = (u - cx_d) * z / fx_d
                 Yd = (v - cy_d) * z / fy_d
                 Pc = R @ np.array([Xd, Yd, z], dtype=np.float32) + t
-
                 Zc = float(Pc[2])
                 if Zc <= 0.0:
                     continue
                 up = int(round(fx_c * (float(Pc[0]) / Zc) + cx_c))
                 vp = int(round(fy_c * (float(Pc[1]) / Zc) + cy_c))
-
                 if up < 0 or up >= Wc or vp < 0 or vp >= Hc:
                     continue
                 if mask[vp, up] == 0:
                     continue
-
                 points_color.append(Pc)
 
         if len(points_color) < min_pts:
@@ -424,7 +447,7 @@ class BottleDetector(Node):
             self._publish_invalid()
             return
 
-        mask, bbox, conf = self._run_yolo(self.latest_rgb)
+        mask, bbox, conf, bottom_cut_fraction = self._run_yolo(self.latest_rgb)
         if mask is None:
             self.get_logger().debug('No bottle detected')
             self._publish_invalid()
@@ -441,6 +464,16 @@ class BottleDetector(Node):
         if centroid_base is None:
             self._publish_invalid()
             return
+
+        # If bottle is partially below frame, shift the centroid down
+        # The centroid is currently biased toward the top of the bottle
+        # Shift z down by the estimated fraction of the bottle that's hidden
+        # Scale factor: typical water bottle height ~0.25m
+        BOTTLE_HEIGHT_M = 0.25
+        if bottom_cut_fraction > 0.0:
+            z_shift = -bottom_cut_fraction * BOTTLE_HEIGHT_M * 0.5
+            centroid_base[2] += z_shift
+            self.get_logger().info(f'Applied z correction: {z_shift:.3f}m')
 
         self._pose_filter.update(centroid_base)
         if not self._pose_filter.is_stable:

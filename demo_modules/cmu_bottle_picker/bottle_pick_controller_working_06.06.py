@@ -24,7 +24,7 @@ from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import PoseStamped, TwistStamped, Vector3Stamped
 from std_srvs.srv import Trigger
 
-from arm_interfaces.srv import SetMode, CheckReachability
+from arm_interfaces.srv import CheckReachability
 from arm_interfaces.action import ReachPreset
 from rclpy.action import ActionClient
 
@@ -42,17 +42,14 @@ MAX_Z =  0.7
 MIN_Z = -0.5
 
 # ── Motion parameters ─────────────────────────────────────────────────────────
-PHASE_TIMEOUT_S  = 15.0   # max seconds per move
-MIN_MOVE_TIME_S  =  0.5   # wait this long before checking if arm settled
-SPEED_THRESHOLD  =  0.005 # m/s — EE considered stopped below this
+PHASE_TIMEOUT_S  = 4  # max seconds per move
+MIN_MOVE_TIME_S  =  3  # wait this long before checking if arm settled
+SPEED_THRESHOLD  =  0.12 # m/s — EE considered stopped below this
 FORCE_THRESHOLD  = 15.0   # N — contact detection during descent
 POLL_RATE_S      =  0.05  # seconds between polls
 
 # ── Stale pose rejection ───────────────────────────────────────────────────────
 POSE_MAX_AGE_S = 10.0
-
-# ── arm_driver mode values ────────────────────────────────────────────────────
-MODE_OPEN_DOOR = 1   # authorizes 'cmu' source for position commands
 
 # ── Service timeouts ──────────────────────────────────────────────────────────
 SERVICE_TIMEOUT_S = 10.0
@@ -65,9 +62,6 @@ class BottlePickController(Node):
         self._cb_group = ReentrantCallbackGroup()
 
         # ── Service clients ────────────────────────────────────────────────────
-        self._set_mode_client = self.create_client(
-            SetMode, "/arm/set_mode", callback_group=self._cb_group
-        )
         self._open_gripper_client = self.create_client(
             Trigger, "/arm/open_gripper", callback_group=self._cb_group
         )
@@ -135,7 +129,6 @@ class BottlePickController(Node):
 
     def _wait_for_services(self) -> bool:
         for client in [
-            self._set_mode_client,
             self._open_gripper_client,
             self._close_gripper_client,
             self._check_reachability_client,
@@ -145,19 +138,6 @@ class BottlePickController(Node):
                     f"Service {client.srv_name} not available after {SERVICE_TIMEOUT_S}s"
                 )
                 return False
-        return True
-
-    def _set_mode(self, mode: int) -> bool:
-        req = SetMode.Request()
-        req.mode = mode
-        future = self._set_mode_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
-        if future.result() is None:
-            self.get_logger().error("set_mode: no response")
-            return False
-        if not future.result().success:
-            self.get_logger().error(f"set_mode rejected: {future.result().message}")
-            return False
         return True
 
     def _call_trigger(self, client, label: str) -> bool:
@@ -241,7 +221,7 @@ class BottlePickController(Node):
             return False
 
         self.get_logger().info(f"Moving to x={x:.3f} y={y:.3f} z={z:.3f}")
-
+        
         pose = self._make_pose(x, y, z)
         for _ in range(5):
             self._cartesian_pose_pub.publish(pose)
@@ -250,11 +230,14 @@ class BottlePickController(Node):
         time.sleep(MIN_MOVE_TIME_S)
 
         deadline = time.monotonic() + PHASE_TIMEOUT_S
+        deadline = time.monotonic() + PHASE_TIMEOUT_S
         while time.monotonic() < deadline:
             time.sleep(POLL_RATE_S)
 
             speed = self._get_ee_speed()
             force = self._get_ee_force()
+
+            self.get_logger().info(f"speed={speed:.4f} m/s  force={force:.1f} N")
 
             if check_force and force > FORCE_THRESHOLD:
                 self.get_logger().info(f"Contact detected ({force:.1f} N)")
@@ -325,14 +308,8 @@ class BottlePickController(Node):
 
         self.get_logger().info(f"[STEP 0] Bottle at x={x:.3f} y={y:.3f} z={z:.3f}")
 
-        # Step 1: set arm mode
-        self.get_logger().info("[STEP 1] Setting arm to OPEN_DOOR mode")
-        if not self._set_mode(MODE_OPEN_DOOR):
-            self.get_logger().error("ABORT: Could not set arm mode")
-            return False
-
-        # Step 2: open gripper
-        self.get_logger().info("[STEP 2] Opening gripper")
+        # Step 1: open gripper
+        self.get_logger().info("[STEP 1] Opening gripper")
         if not self._open_gripper():
             self.get_logger().error("ABORT: Could not open gripper")
             return False
