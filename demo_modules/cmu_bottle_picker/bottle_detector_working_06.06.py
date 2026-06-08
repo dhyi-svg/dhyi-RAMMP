@@ -45,12 +45,16 @@ import tf2_geometry_msgs
 import torch
 from ultralytics import YOLO
 from realsense2_camera_msgs.msg import Extrinsics
+from reachability_checker import ReachabilityChecker
 
 MODEL_PATH = '/home/cailyns/yolo11n-seg.pt'
 CONF_THRESHOLD = 0.25
 
 # How many pixels from the border counts as "touching"
 BORDER_MARGIN_PX = 5
+
+# Must match bottle_pick_controller.py
+EE_QUAT = [0.505, 0.628, 0.389, 0.447]  # [x, y, z, w]
 
 
 def depth_to_meters(depth_cv: np.ndarray) -> np.ndarray:
@@ -126,6 +130,8 @@ class BottleDetector(Node):
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self._reachability_checker = ReachabilityChecker(self, EE_QUAT)
 
         self.bottle_pose_pub = self.create_publisher(PoseStamped, '/arm/bottle/pose', 10)
         self.debug_pt_pub = self.create_publisher(PointStamped, '/bottle/debug_point_base', 10)
@@ -274,9 +280,18 @@ class BottleDetector(Node):
         if len(r.boxes) == 0:
             return None, None, None, 0.0
 
-        best = r.boxes.conf.argmax().item()
+        # Only consider bottle detections (COCO class 39)
+        bottle_indices = [
+            i for i in range(len(r.boxes))
+            if int(r.boxes.cls[i].item()) == 39
+        ]
+        if len(bottle_indices) == 0:
+            self.get_logger().debug('No bottle class (39) detected')
+            return None, None, None, 0.0
+        best = max(bottle_indices, key=lambda i: float(r.boxes.conf[i].item()))
+
         mask_poly = r.masks.xy[best]
-        conf_val = r.boxes.conf[best].item()
+        conf_val = float(r.boxes.conf[best].item())
         bbox = r.boxes.xyxy[best].cpu().numpy()
 
         h, w = img.shape[:2]
@@ -306,7 +321,6 @@ class BottleDetector(Node):
                 if visible_height > 0:
                     # Assume bottle is symmetric — estimate true bottom by mirroring
                     # the visible portion below the detected bottom
-                    mask_center_px = (mask_top_px + mask_bottom_px) / 2.0
                     estimated_true_bottom = 2.0 * mask_bottom_px - mask_top_px
                     pixels_below = max(0.0, estimated_true_bottom - (h - 1))
                     estimated_true_height = visible_height + pixels_below
@@ -466,9 +480,6 @@ class BottleDetector(Node):
             return
 
         # If bottle is partially below frame, shift the centroid down
-        # The centroid is currently biased toward the top of the bottle
-        # Shift z down by the estimated fraction of the bottle that's hidden
-        # Scale factor: typical water bottle height ~0.25m
         BOTTLE_HEIGHT_M = 0.25
         if bottom_cut_fraction > 0.0:
             z_shift = -bottom_cut_fraction * BOTTLE_HEIGHT_M * 0.5
@@ -481,7 +492,16 @@ class BottleDetector(Node):
             self._publish_invalid()
             return
 
-        self._publish_bottle_pose(self._pose_filter.xyz)
+        # Fire async reachability check — result available next cycle
+        filtered_xyz = self._pose_filter.xyz
+        self._reachability_checker.check_async(filtered_xyz)
+
+        if not self._reachability_checker.is_reachable:
+            self.get_logger().debug('Bottle not reachable — publishing invalid')
+            self._publish_invalid()
+            return
+
+        self._publish_bottle_pose(filtered_xyz)
 
 
 def main():
