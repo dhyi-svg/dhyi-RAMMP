@@ -20,13 +20,23 @@ import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.action import ActionClient
 
-from geometry_msgs.msg import PoseStamped, TwistStamped, Vector3Stamped
+from geometry_msgs.msg import PoseStamped, TwistStamped, Vector3Stamped, Twist
 from std_srvs.srv import Trigger
 
 from arm_interfaces.srv import CheckReachability
+
+# Direct Kortex imports for partial gripper control
+try:
+    from kortex_api.TCPTransport import TCPTransport
+    from kortex_api.RouterClient import RouterClient
+    from kortex_api.SessionManager import SessionManager
+    from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
+    from kortex_api.autogen.messages import Session_pb2, Base_pb2
+except ModuleNotFoundError:
+    pass
 from arm_interfaces.action import ReachPreset
-from rclpy.action import ActionClient
 
 # ── Pick geometry ──────────────────────────────────────────────────────────────
 APPROACH_HEIGHT = 0.12   # m above bottle centroid for pre-grasp approach
@@ -42,9 +52,9 @@ MAX_Z =  0.7
 MIN_Z = -0.5
 
 # ── Motion parameters ─────────────────────────────────────────────────────────
-PHASE_TIMEOUT_S  = 4  # max seconds per move
-MIN_MOVE_TIME_S  =  3  # wait this long before checking if arm settled
-SPEED_THRESHOLD  =  0.12 # m/s — EE considered stopped below this
+PHASE_TIMEOUT_S  =  4.0   # max seconds per move
+MIN_MOVE_TIME_S  =  3.0   # wait this long before checking if arm settled
+SPEED_THRESHOLD  =  0.12  # m/s — EE considered stopped below this
 FORCE_THRESHOLD  = 15.0   # N — contact detection during descent
 POLL_RATE_S      =  0.05  # seconds between polls
 
@@ -72,6 +82,11 @@ class BottlePickController(Node):
             CheckReachability, "/arm/check_reachability", callback_group=self._cb_group
         )
 
+        # ── Action client for homing ───────────────────────────────────────────
+        self._reach_preset_client = ActionClient(
+            self, ReachPreset, "/arm/reach_preset", callback_group=self._cb_group
+        )
+
         # ── Publishers ─────────────────────────────────────────────────────────
         self._cartesian_pose_pub = self.create_publisher(
             PoseStamped, "/arm/cmu/cartesian_pose", 10
@@ -92,10 +107,6 @@ class BottlePickController(Node):
         self._latest_pose_time = None
         self.create_subscription(
             PoseStamped, "/arm/bottle/pose", self._cb_bottle_pose, 10
-        )
-
-        self._reach_preset_client = ActionClient(
-            self, ReachPreset, "/arm/reach_preset", callback_group=self._cb_group
         )
 
         self.get_logger().info("BottlePickController ready")
@@ -164,6 +175,36 @@ class BottlePickController(Node):
             time.sleep(1.5)
         return ok
 
+    def _partial_close_gripper(self, value=0.6) -> bool:
+        """Close gripper to a partial position via direct Kortex command.
+
+        Args:
+            value: Gripper position 0.0 (open) to 1.0 (fully closed). Default 0.6.
+        """
+        try:
+            transport = TCPTransport()
+            transport.connect('192.168.1.10', 10000)
+            router = RouterClient(transport, lambda kx: None)
+            session_manager = SessionManager(router)
+            session_manager.CreateSession(Session_pb2.CreateSessionInfo(
+                username='admin',
+                password='admin',
+            ))
+            base = BaseClient(router)
+            cmd = Base_pb2.GripperCommand()
+            cmd.mode = Base_pb2.GRIPPER_POSITION
+            finger = cmd.gripper.finger.add()
+            finger.value = float(value)
+            base.SendGripperCommand(cmd)
+            time.sleep(1.5)
+            session_manager.CloseSession()
+            transport.disconnect()
+            self.get_logger().info(f"Partial gripper close OK (value={value:.2f})")
+            return True
+        except Exception as e:
+            self.get_logger().error(f"partial_close_gripper failed: {e}")
+            return False
+
     def _check_position_safe(self, x, y, z) -> bool:
         if x > MAX_X or abs(y) > MAX_Y:
             self.get_logger().error(
@@ -221,7 +262,7 @@ class BottlePickController(Node):
             return False
 
         self.get_logger().info(f"Moving to x={x:.3f} y={y:.3f} z={z:.3f}")
-        
+
         pose = self._make_pose(x, y, z)
         for _ in range(5):
             self._cartesian_pose_pub.publish(pose)
@@ -230,14 +271,11 @@ class BottlePickController(Node):
         time.sleep(MIN_MOVE_TIME_S)
 
         deadline = time.monotonic() + PHASE_TIMEOUT_S
-        deadline = time.monotonic() + PHASE_TIMEOUT_S
         while time.monotonic() < deadline:
             time.sleep(POLL_RATE_S)
 
             speed = self._get_ee_speed()
             force = self._get_ee_force()
-
-            self.get_logger().info(f"speed={speed:.4f} m/s  force={force:.1f} N")
 
             if check_force and force > FORCE_THRESHOLD:
                 self.get_logger().info(f"Contact detected ({force:.1f} N)")
@@ -250,10 +288,10 @@ class BottlePickController(Node):
         self.get_logger().warn(f"Move timed out after {PHASE_TIMEOUT_S}s — continuing")
         return True
 
-    # ── Pick sequence ──────────────────────────────────────────────────────────
+    # ── Home ───────────────────────────────────────────────────────────────────
 
     def _go_home(self):
-        """Send arm to RAMMP home preset — no mode change needed."""
+        """Send arm to RAMMP home preset."""
         self.get_logger().info("Returning to home...")
 
         if not self._reach_preset_client.wait_for_server(timeout_sec=5.0):
@@ -279,6 +317,8 @@ class BottlePickController(Node):
         while not result_future.done() and time.time() < deadline:
             time.sleep(0.05)
         self.get_logger().info("Home complete")
+
+    # ── Pick sequence ──────────────────────────────────────────────────────────
 
     def pick(self) -> bool:
         self.get_logger().info("=== PICK SEQUENCE START ===")
@@ -314,30 +354,32 @@ class BottlePickController(Node):
             self.get_logger().error("ABORT: Could not open gripper")
             return False
 
-        # Step 3: approach above bottle
-        self.get_logger().info("[STEP 3] Approaching above bottle")
+        # Step 2: approach above bottle
+        self.get_logger().info("[STEP 2] Approaching above bottle")
         if not self._move_to_xyz(x, y, z + APPROACH_HEIGHT):
             self.get_logger().error("ABORT: Approach failed")
             return False
 
-        # Step 4: descend to grasp with contact detection
-        self.get_logger().info("[STEP 4] Descending to grasp")
+        # Step 3: descend to grasp with contact detection
+        self.get_logger().info("[STEP 3] Descending to grasp")
         if not self._move_to_xyz(x, y, z + GRASP_Z_OFFSET, check_force=True):
             self.get_logger().error("ABORT: Grasp descent failed")
             return False
 
-        # Step 5: close gripper
-        self.get_logger().info("[STEP 5] Closing gripper")
-        if not self._close_gripper():
+        # Step 4: close gripper (partial to avoid crushing bottle)
+        self.get_logger().info("[STEP 4] Closing gripper")
+        if not self._partial_close_gripper(0.6):
             self.get_logger().error("ABORT: Could not close gripper")
             return False
 
-        # Step 6: return to home
-        self.get_logger().info("[STEP 6] Returning to home")
+        # Step 5: return to home
+        self.get_logger().info("[STEP 5] Returning to home")
         self._go_home()
 
         self.get_logger().info("=== PICK COMPLETE ===")
         return True
+
+
 
 
 def main():
