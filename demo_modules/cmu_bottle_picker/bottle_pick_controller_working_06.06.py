@@ -22,10 +22,11 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionClient
 
-from geometry_msgs.msg import PoseStamped, TwistStamped, Vector3Stamped, Twist
-from std_srvs.srv import Trigger
+from geometry_msgs.msg import PoseStamped, TwistStamped, Vector3Stamped
+from std_srvs.srv import Trigger, SetBool
 
 from arm_interfaces.srv import CheckReachability
+from arm_interfaces.action import ReachPreset
 
 # Direct Kortex imports for partial gripper control
 try:
@@ -36,7 +37,6 @@ try:
     from kortex_api.autogen.messages import Session_pb2, Base_pb2
 except ModuleNotFoundError:
     pass
-from arm_interfaces.action import ReachPreset
 
 # ── Pick geometry ──────────────────────────────────────────────────────────────
 APPROACH_HEIGHT = 0.12   # m above bottle centroid for pre-grasp approach
@@ -46,10 +46,15 @@ GRASP_Z_OFFSET  = 0.02   # m above bottle centroid for grasp
 EE_QUAT = [0.505, 0.628, 0.389, 0.447]  # [x, y, z, w]
 
 # ── Safety limits ──────────────────────────────────────────────────────────────
-MAX_X =  1.0
+MAX_X =  1.2
 MAX_Y =  0.5
-MAX_Z =  0.7
+MAX_Z =  0.8
 MIN_Z = -0.5
+
+# ── Handoff position ───────────────────────────────────────────────────────────
+HANDOFF_X = 0.7
+HANDOFF_Y = 0.0
+HANDOFF_Z = 0.55
 
 # ── Motion parameters ─────────────────────────────────────────────────────────
 PHASE_TIMEOUT_S  =  4.0   # max seconds per move
@@ -72,6 +77,9 @@ class BottlePickController(Node):
         self._cb_group = ReentrantCallbackGroup()
 
         # ── Service clients ────────────────────────────────────────────────────
+        self._detection_enable_client = self.create_client(
+            SetBool, "/arm/bottle/detection/enable", callback_group=self._cb_group
+        )
         self._open_gripper_client = self.create_client(
             Trigger, "/arm/open_gripper", callback_group=self._cb_group
         )
@@ -175,11 +183,11 @@ class BottlePickController(Node):
             time.sleep(1.5)
         return ok
 
-    def _partial_close_gripper(self, value=0.6) -> bool:
+    def _partial_close_gripper(self, value=0.41) -> bool:
         """Close gripper to a partial position via direct Kortex command.
 
         Args:
-            value: Gripper position 0.0 (open) to 1.0 (fully closed). Default 0.6.
+            value: Gripper position 0.0 (open) to 1.0 (fully closed). Default 0.41.
         """
         try:
             transport = TCPTransport()
@@ -194,6 +202,7 @@ class BottlePickController(Node):
             cmd = Base_pb2.GripperCommand()
             cmd.mode = Base_pb2.GRIPPER_POSITION
             finger = cmd.gripper.finger.add()
+            finger.finger_identifier = 1
             finger.value = float(value)
             base.SendGripperCommand(cmd)
             time.sleep(1.5)
@@ -204,6 +213,21 @@ class BottlePickController(Node):
         except Exception as e:
             self.get_logger().error(f"partial_close_gripper failed: {e}")
             return False
+
+    def _reset_detector(self):
+        """Reset the bottle detector for a fresh stable reading."""
+        self.get_logger().info("Resetting detector for fresh reading...")
+        req_off = SetBool.Request()
+        req_off.data = False
+        future = self._detection_enable_client.call_async(req_off)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        time.sleep(1.0)
+        req_on = SetBool.Request()
+        req_on.data = True
+        future = self._detection_enable_client.call_async(req_on)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        self.get_logger().info("Detector reset — waiting for stable reading...")
+        time.sleep(3.0)
 
     def _check_position_safe(self, x, y, z) -> bool:
         if x > MAX_X or abs(y) > MAX_Y:
@@ -326,6 +350,9 @@ class BottlePickController(Node):
         if not self._wait_for_services():
             return False
 
+        # Reset detector for fresh stable reading
+        self._reset_detector()
+
         # Validate bottle pose
         pose = self.latest_bottle_pose
         if pose is None:
@@ -366,9 +393,9 @@ class BottlePickController(Node):
             self.get_logger().error("ABORT: Grasp descent failed")
             return False
 
-        # Step 4: close gripper (partial to avoid crushing bottle)
+        # Step 4: partial close gripper (41% to avoid crushing bottle)
         self.get_logger().info("[STEP 4] Closing gripper")
-        if not self._partial_close_gripper(0.6):
+        if not self._partial_close_gripper(0.41):
             self.get_logger().error("ABORT: Could not close gripper")
             return False
 
@@ -376,10 +403,27 @@ class BottlePickController(Node):
         self.get_logger().info("[STEP 5] Returning to home")
         self._go_home()
 
+        # Step 6: wait for user input then move to handoff and release
+        self.get_logger().info("[STEP 6] Press ENTER to release bottle...")
+        input()
+        self.get_logger().info("[STEP 6] Moving to handoff position")
+        self._move_to_xyz(HANDOFF_X, HANDOFF_Y, HANDOFF_Z)
+
+        # Wait for arm to settle before releasing
+        self.get_logger().info("[STEP 7] Waiting for arm to settle...")
+        time.sleep(MIN_MOVE_TIME_S)
+        deadline = time.monotonic() + PHASE_TIMEOUT_S
+        while time.monotonic() < deadline:
+            time.sleep(POLL_RATE_S)
+            speed = self._get_ee_speed()
+            if speed is not None and speed < SPEED_THRESHOLD:
+                break
+
+        self.get_logger().info("[STEP 7] Releasing bottle")
+        self._open_gripper()
+
         self.get_logger().info("=== PICK COMPLETE ===")
         return True
-
-
 
 
 def main():
@@ -391,9 +435,6 @@ def main():
 
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
-
-    print("Waiting 5s for bottle pose...")
-    time.sleep(5.0)
 
     try:
         success = node.pick()
