@@ -1,523 +1,523 @@
-#!/usr/bin/env python3
 """
-Bottle detector node for RAMMP demo.
+Bottle pick controller for RAMMP demo.
 
-Uses YOLO segmentation + depth image for 3D localization.
-Mirrors the approach used in last year's button_detector.py for efficiency
-on the Jetson Orin Nano.
+Subscribes to /arm/bottle/pose from the bottle detector and executes
+a full pick sequence using the arm_driver ROS interface.
 
-Partial detection handling:
-  - If the bottle mask touches the bottom of the frame, the bottle extends
-    further down than detected. The centroid is shifted down proportionally
-    based on how much of the bottle is estimated to be out of frame.
-  - If the mask touches any other border, the detection is rejected.
-
-Lifecycle:
-  - On launch: initialize subscribers, publishers, TF. YOLO not loaded yet.
-  - On /arm/bottle/detection/enable = True: load YOLO, start detection loop.
-  - On /arm/bottle/detection/enable = False: stop detection, unload YOLO, free GPU.
-
-Publishes:
-  - /arm/bottle/pose (geometry_msgs/PoseStamped): filtered bottle position in base_link.
-    Publishes -1/-1/-1 when no valid detection.
+Movement mirrors ButtonPushController from last year:
+  - Check reachability via /arm/check_reachability before each move
+  - Publish PoseStamped to /arm/cmu/cartesian_pose
+  - Poll /arm/ee/velocity to wait for arm to fully settle
+  - Monitor /arm/ee/force for contact during descent
 """
 
 import time
-import numpy as np
-import cv2
+import threading
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.duration import Duration
-from rclpy.qos import (
-    qos_profile_sensor_data,
-    QoSProfile,
-    ReliabilityPolicy,
-    DurabilityPolicy,
-    HistoryPolicy,
-)
-from std_srvs.srv import SetBool
-from cv_bridge import CvBridge
-from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PointStamped, PoseStamped
-import tf2_ros
-import tf2_geometry_msgs
-import torch
-from ultralytics import YOLO
-from realsense2_camera_msgs.msg import Extrinsics
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 
-MODEL_PATH = '/home/cailyns/yolo11n-seg.pt'
-CONF_THRESHOLD = 0.50
+from geometry_msgs.msg import PoseStamped, TwistStamped, Vector3Stamped
+from std_srvs.srv import Trigger, SetBool
 
-# How many pixels from the border counts as "touching"
-BORDER_MARGIN_PX = 5
+from arm_interfaces.srv import CheckReachability
+from arm_interfaces.action import ReachPreset
+from rclpy.action import ActionClient
 
+# ── Pick geometry ──────────────────────────────────────────────────────────────
+APPROACH_HEIGHT = 0.12   # m above bottle centroid for pre-grasp approach
+GRASP_Z_OFFSET  = 0.02
 
-def depth_to_meters(depth_cv: np.ndarray) -> np.ndarray:
-    if depth_cv.dtype == np.uint16:
-        return depth_cv.astype(np.float32) * 0.001
-    return depth_cv.astype(np.float32)
+# Handoff position — tune for demo
+HANDOFF_X = 0.7
+HANDOFF_Y = 0.0
+HANDOFF_Z = 0.55   # m above bottle centroid for grasp
 
+# Natural EE orientation when arm reaches toward the bottle
+EE_QUAT = [0.505, 0.628, 0.389, 0.447]  # [x, y, z, w]
 
-class PoseFilter:
-    def __init__(self, alpha=0.3, min_samples=3):
-        self.alpha = alpha
-        self.min_samples = min_samples
-        self._count = 0
-        self._xyz = np.zeros(3, dtype=np.float64)
+# ── Safety limits ──────────────────────────────────────────────────────────────
+MAX_X =  1.0
+MAX_Y =  0.5
+MAX_Z =  0.8
+MIN_Z = -0.5
 
-    def update(self, xyz):
-        if self._count == 0:
-            self._xyz = xyz.astype(np.float64)
-        else:
-            self._xyz = self.alpha * xyz + (1.0 - self.alpha) * self._xyz
-        self._count += 1
+# ── Motion parameters ─────────────────────────────────────────────────────────
+PHASE_TIMEOUT_S  = 4  # max seconds per move
+MIN_MOVE_TIME_S  =  3  # wait this long before checking if arm settled
+SPEED_THRESHOLD  =  0.12 # m/s — EE considered stopped below this
+FORCE_THRESHOLD  = 15.0   # N — contact detection during descent
+POLL_RATE_S      =  0.05  # seconds between polls
 
-    @property
-    def is_stable(self):
-        return self._count >= self.min_samples
+# ── Stale pose rejection ───────────────────────────────────────────────────────
+POSE_MAX_AGE_S = 10.0
 
-    @property
-    def xyz(self):
-        return self._xyz.copy()
-
-    def reset(self):
-        self._count = 0
-        self._xyz = np.zeros(3, dtype=np.float64)
+# ── Service timeouts ──────────────────────────────────────────────────────────
+SERVICE_TIMEOUT_S = 10.0
 
 
-class BottleDetector(Node):
+class BottlePickController(Node):
     def __init__(self):
-        super().__init__('bottle_detector')
+        super().__init__("bottle_pick_controller")
 
-        self.declare_parameter('rgb_topic', '/camera/camera/color/image_raw')
-        self.declare_parameter('depth_topic', '/camera/camera/depth/image_rect_raw')
-        self.declare_parameter('color_info_topic', '/camera/camera/color/camera_info')
-        self.declare_parameter('depth_info_topic', '/camera/camera/depth/camera_info')
-        self.declare_parameter('extrinsics_topic', '/camera/camera/extrinsics/depth_to_color')
-        self.declare_parameter('color_optical_frame', 'camera_color_optical_frame')
-        self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('detection_confidence', CONF_THRESHOLD)
-        self.declare_parameter('filter_alpha', 0.3)
-        self.declare_parameter('filter_min_samples', 3)
-        self.declare_parameter('process_rate_hz', 5.0)
-        self.declare_parameter('tf_timeout_s', 0.5)
-        self.declare_parameter('min_depth_m', 0.10)
-        self.declare_parameter('max_depth_m', 3.00)
-        self.declare_parameter('min_mask_points', 10)
-        self.declare_parameter('depth_stride', 2)
-
-        self.bridge = CvBridge()
-        self.latest_rgb = None
-        self.latest_depth_m = None
-        self.color_info = None
-        self.depth_info = None
-        self.depth_to_color_extr = None
-        self.color_frame_id = None
-        self.last_rgb_t = None
-        self._detection_enabled = False
-        self.yolo = None
-        self.yolo_device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-
-        self._pose_filter = PoseFilter(
-            alpha=float(self.get_parameter('filter_alpha').value),
-            min_samples=int(self.get_parameter('filter_min_samples').value),
-        )
-
-        from rclpy.callback_groups import ReentrantCallbackGroup
         self._cb_group = ReentrantCallbackGroup()
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        self.bottle_pose_pub = self.create_publisher(PoseStamped, '/arm/bottle/pose', 10)
-        self.debug_pt_pub = self.create_publisher(PointStamped, '/bottle/debug_point_base', 10)
+        # ── Service clients ────────────────────────────────────────────────────
+        self._detection_enable_client = self.create_client(
+            SetBool, "/arm/bottle/detection/enable", callback_group=self._cb_group
+        )
 
-        self.create_service(SetBool, '/arm/bottle/detection/enable', self._srv_detection_enable)
+        self._open_gripper_client = self.create_client(
+            Trigger, "/arm/open_gripper", callback_group=self._cb_group
+        )
+        self._close_gripper_client = self.create_client(
+            Trigger, "/arm/close_gripper", callback_group=self._cb_group
+        )
+        self._check_reachability_client = self.create_client(
+            CheckReachability, "/arm/check_reachability", callback_group=self._cb_group
+        )
 
+        # ── Publishers ─────────────────────────────────────────────────────────
+        self._cartesian_pose_pub = self.create_publisher(
+            PoseStamped, "/arm/cmu/cartesian_pose", 10
+        )
+
+        # ── Subscribers ────────────────────────────────────────────────────────
+        self._latest_ee_velocity = None
         self.create_subscription(
-            Image, self.get_parameter('rgb_topic').value, self._cb_rgb, qos_profile_sensor_data, callback_group=self._cb_group
+            TwistStamped, "/arm/ee/velocity", self._cb_ee_velocity, 10
         )
+
+        self._latest_ee_force = None
         self.create_subscription(
-            Image, self.get_parameter('depth_topic').value, self._cb_depth, qos_profile_sensor_data, callback_group=self._cb_group
+            Vector3Stamped, "/arm/ee/force", self._cb_ee_force, 10
         )
+
+        self.latest_bottle_pose = None
+        self._latest_pose_time = None
         self.create_subscription(
-            CameraInfo, self.get_parameter('color_info_topic').value, self._cb_color_info, 10, callback_group=self._cb_group
-        )
-        self.create_subscription(
-            CameraInfo, self.get_parameter('depth_info_topic').value, self._cb_depth_info, 10, callback_group=self._cb_group
+            PoseStamped, "/arm/bottle/pose", self._cb_bottle_pose, 10
         )
 
-        qos_extr = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST, depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        )
-        self.create_subscription(
-            Extrinsics, self.get_parameter('extrinsics_topic').value, self._cb_extrinsics, qos_extr, callback_group=self._cb_group
+        self._reach_preset_client = ActionClient(
+            self, ReachPreset, "/arm/reach_preset", callback_group=self._cb_group
         )
 
-        rate = float(self.get_parameter('process_rate_hz').value)
-        self.create_timer(1.0 / max(rate, 0.1), self._process_once, callback_group=self._cb_group)
-
-        self.get_logger().info('BottleDetector started — YOLO not loaded yet')
-        self.get_logger().info('Call /arm/bottle/detection/enable (True) to start')
-
-    # ── YOLO load/unload ───────────────────────────────────────────────────────
-
-    def _load_yolo(self):
-        if self.yolo is not None:
-            return
-        self.get_logger().info(f'Loading YOLO: {MODEL_PATH}')
-        try:
-            self.yolo = YOLO(MODEL_PATH)
-            self.yolo.to(self.yolo_device)
-            self.get_logger().info(f'YOLO loaded on {self.yolo_device}')
-        except Exception as e:
-            if self.yolo_device.startswith('cuda'):
-                self.get_logger().warn(f'GPU load failed: {e} — trying CPU')
-                self.yolo_device = 'cpu'
-                self.yolo = YOLO(MODEL_PATH)
-                self.yolo.to(self.yolo_device)
-            else:
-                self.yolo = None
-                raise
-
-    def _unload_yolo(self):
-        if self.yolo is None:
-            return
-        self.get_logger().info('Unloading YOLO — freeing GPU memory')
-        del self.yolo
-        self.yolo = None
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-    def _srv_detection_enable(self, request, response):
-        if request.data:
-            try:
-                self._load_yolo()
-            except Exception as e:
-                response.success = False
-                response.message = f'Failed to load YOLO: {e}'
-                return response
-            self._pose_filter.reset()
-            self._detection_enabled = True
-            self.get_logger().info('Detection ENABLED')
-            response.message = 'Detection started'
-        else:
-            self._detection_enabled = False
-            self._pose_filter.reset()
-            self._unload_yolo()
-            self.get_logger().info('Detection DISABLED')
-            response.message = 'Detection stopped'
-        response.success = True
-        return response
+        self.get_logger().info("BottlePickController ready")
 
     # ── Callbacks ──────────────────────────────────────────────────────────────
 
-    def _cb_rgb(self, msg):
-        try:
-            self.latest_rgb = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-            self.last_rgb_t = time.time()
-            self.color_frame_id = msg.header.frame_id
-        except Exception as e:
-            self.get_logger().debug(f'RGB convert failed: {e}')
+    def _cb_ee_velocity(self, msg: TwistStamped):
+        v = msg.twist.linear
+        self._latest_ee_velocity = np.array([v.x, v.y, v.z])
 
-    def _cb_depth(self, msg):
-        try:
-            depth_cv = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            self.latest_depth_m = depth_to_meters(depth_cv)
-        except Exception as e:
-            self.get_logger().debug(f'Depth convert failed: {e}')
+    def _cb_ee_force(self, msg: Vector3Stamped):
+        self._latest_ee_force = np.array([msg.vector.x, msg.vector.y, msg.vector.z])
 
-    def _cb_color_info(self, msg):
-        self.color_info = msg
-        if msg.header.frame_id:
-            self.color_frame_id = msg.header.frame_id
+    def _cb_bottle_pose(self, msg: PoseStamped):
+        self.latest_bottle_pose = msg
+        self._latest_pose_time = self.get_clock().now()
 
-    def _cb_depth_info(self, msg):
-        self.depth_info = msg
+    # ── Sensor helpers ─────────────────────────────────────────────────────────
 
-    def _cb_extrinsics(self, msg):
-        self.depth_to_color_extr = msg
+    def _get_ee_speed(self):
+        if self._latest_ee_velocity is None:
+            return None
+        return float(np.linalg.norm(self._latest_ee_velocity))
 
-    # ── YOLO ──────────────────────────────────────────────────────────────────
+    def _get_ee_force(self):
+        if self._latest_ee_force is None:
+            return 0.0
+        return float(np.linalg.norm(self._latest_ee_force))
 
-    def _run_yolo(self, img):
-        """Run YOLO and return (mask, bbox, conf, bottom_cut_fraction).
+    # ── Service helpers ────────────────────────────────────────────────────────
 
-        bottom_cut_fraction: fraction of bottle estimated to be below frame (0.0 = fully visible).
-        Returns (None, None, None, 0.0) if no valid detection.
+    def _wait_for_services(self) -> bool:
+        for client in [
+            self._open_gripper_client,
+            self._close_gripper_client,
+            self._check_reachability_client,
+        ]:
+            if not client.wait_for_service(timeout_sec=SERVICE_TIMEOUT_S):
+                self.get_logger().error(
+                    f"Service {client.srv_name} not available after {SERVICE_TIMEOUT_S}s"
+                )
+                return False
+        return True
+
+    def _call_trigger(self, client, label: str) -> bool:
+        future = client.call_async(Trigger.Request())
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        if future.result() is None:
+            self.get_logger().error(f"{label}: no response")
+            return False
+        if not future.result().success:
+            self.get_logger().error(f"{label} failed: {future.result().message}")
+            return False
+        self.get_logger().info(f"{label} OK")
+        return True
+
+    def _open_gripper(self) -> bool:
+        ok = self._call_trigger(self._open_gripper_client, "open_gripper")
+        if ok:
+            time.sleep(1.5)
+        return ok
+
+    def _close_gripper(self) -> bool:
+        ok = self._call_trigger(self._close_gripper_client, "close_gripper")
+        if ok:
+            time.sleep(1.5)
+        return ok
+
+
+    def _partial_close_gripper(self, value=0.6) -> bool:
+        """Close gripper to a partial position via direct Kortex command.
+
+        Args:
+            value: Gripper position 0.0 (open) to 1.0 (fully closed). Default 0.6.
         """
-        if self.yolo is None:
-            return None, None, None, 0.0
         try:
-            results = self.yolo(
-                img,
-                conf=float(self.get_parameter('detection_confidence').value),
-                verbose=False,
-                device=self.yolo_device,
-            )
+            from kortex_api.TCPTransport import TCPTransport
+            from kortex_api.RouterClient import RouterClient
+            from kortex_api.SessionManager import SessionManager
+            from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
+            from kortex_api.autogen.messages import Session_pb2, Base_pb2
+            transport = TCPTransport()
+            transport.connect('192.168.1.10', 10000)
+            router = RouterClient(transport, lambda kx: None)
+            session_manager = SessionManager(router)
+            session_manager.CreateSession(Session_pb2.CreateSessionInfo(
+                username='admin',
+                password='admin',
+            ))
+            base = BaseClient(router)
+            cmd = Base_pb2.GripperCommand()
+            cmd.mode = Base_pb2.GRIPPER_POSITION
+            finger = cmd.gripper.finger.add()
+            finger.value = float(value)
+            base.SendGripperCommand(cmd)
+            time.sleep(1.5)
+            session_manager.CloseSession()
+            transport.disconnect()
+            self.get_logger().info(f"Partial gripper close OK (value={value:.2f})")
+            return True
         except Exception as e:
-            self.get_logger().debug(f'YOLO failed: {e}')
-            return None, None, None, 0.0
+            self.get_logger().error(f"partial_close_gripper failed: {e}")
+            return False
 
-        n = len(results[0].boxes) if results[0].boxes is not None else 0
-        self.get_logger().info(
-            f'YOLO: {n} detections, classes: '
-            f'{results[0].boxes.cls.tolist() if results[0].boxes is not None else []}'
-        )
-
-        if not results or results[0].masks is None:
-            return None, None, None, 0.0
-        r = results[0]
-        if len(r.boxes) == 0:
-            return None, None, None, 0.0
-
-        # Only consider bottle detections (COCO class 39)
-        bottle_indices = [
-            i for i in range(len(r.boxes))
-            if int(r.boxes.cls[i].item()) == 39
-        ]
-        if len(bottle_indices) == 0:
-            self.get_logger().debug('No bottle class (39) detected')
-            return None, None, None, 0.0
-        best = max(bottle_indices, key=lambda i: float(r.boxes.conf[i].item()))
-
-        mask_poly = r.masks.xy[best]
-        conf_val = float(r.boxes.conf[best].item())
-        bbox = r.boxes.xyxy[best].cpu().numpy()
-
-        h, w = img.shape[:2]
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(mask, [mask_poly.astype(np.int32)], 255)
-
-        # Check which borders the mask touches
-        touches_top    = mask[:BORDER_MARGIN_PX, :].any()
-        touches_left   = mask[:, :BORDER_MARGIN_PX].any()
-        touches_right  = mask[:, -BORDER_MARGIN_PX:].any()
-        touches_bottom = mask[-BORDER_MARGIN_PX:, :].any()
-        self.get_logger().info(f'mask touches: top={touches_top} left={touches_left} right={touches_right} bottom={touches_bottom}')
-
-        # Reject if touches top, left, or right — can't estimate correction
-        if touches_top or touches_left or touches_right:
-            self.get_logger().debug('Rejecting partial detection (touches top/left/right border)')
-            return None, None, None, 0.0
-
-        # If touches bottom, estimate how much of the bottle is below frame
-        bottom_cut_fraction = 0.0
-        if touches_bottom:
-            mask_rows = np.where(mask.any(axis=1))[0]
-            if len(mask_rows) > 0:
-                mask_top_px    = float(mask_rows[0])
-                mask_bottom_px = float(mask_rows[-1])
-                visible_height = mask_bottom_px - mask_top_px
-
-                if visible_height > 0:
-                    # Assume bottle is symmetric — estimate true bottom by mirroring
-                    # the visible portion below the detected bottom
-                    estimated_true_bottom = 2.0 * mask_bottom_px - mask_top_px
-                    pixels_below = max(0.0, estimated_true_bottom - (h - 1))
-                    estimated_true_height = visible_height + pixels_below
-                    bottom_cut_fraction = pixels_below / estimated_true_height
-                    self.get_logger().info(
-                        f'Partial bottom detection: {bottom_cut_fraction:.2f} of bottle below frame'
-                    )
-
-        return mask, bbox, conf_val, bottom_cut_fraction
-
-    # ── 3D from depth image ────────────────────────────────────────────────────
-
-    def _get_centroid_from_depth(self, mask, bbox):
-        """Get 3D centroid using depth image + camera intrinsics."""
-        if self.color_info is None or self.depth_info is None or self.depth_to_color_extr is None:
-            self.get_logger().debug('Missing camera info or extrinsics')
-            return None
-
-        depth_m = self.latest_depth_m
-        if depth_m is None:
-            self.get_logger().debug('No depth image')
-            return None
-
-        Hc, Wc = int(self.color_info.height), int(self.color_info.width)
-        Hd, Wd = depth_m.shape[:2]
-
-        Kc = self.color_info.k
-        fx_c, fy_c, cx_c, cy_c = float(Kc[0]), float(Kc[4]), float(Kc[2]), float(Kc[5])
-        Kd = self.depth_info.k
-        fx_d, fy_d, cx_d, cy_d = float(Kd[0]), float(Kd[4]), float(Kd[2]), float(Kd[5])
-
-        R = np.array(self.depth_to_color_extr.rotation, dtype=np.float32).reshape(3, 3)
-        t = np.array(self.depth_to_color_extr.translation, dtype=np.float32).reshape(3)
-
-        min_z = float(self.get_parameter('min_depth_m').value)
-        max_z = float(self.get_parameter('max_depth_m').value)
-        stride = max(1, int(self.get_parameter('depth_stride').value))
-        min_pts = int(self.get_parameter('min_mask_points').value)
-
-        x1, y1, x2, y2 = bbox.astype(np.float32)
-        margin = 20
-        fx_ratio = fx_d / fx_c if fx_c > 0 else 1.0
-        fy_ratio = fy_d / fy_c if fy_c > 0 else 1.0
-        d_x1 = max(0, int((x1 - cx_c) * fx_ratio + cx_d) - margin)
-        d_x2 = min(Wd, int((x2 - cx_c) * fx_ratio + cx_d) + margin)
-        d_y1 = max(0, int((y1 - cy_c) * fy_ratio + cy_d) - margin)
-        d_y2 = min(Hd, int((y2 - cy_c) * fy_ratio + cy_d) + margin)
-
-        points_color = []
-        for v in range(d_y1, d_y2, stride):
-            for u in range(d_x1, d_x2, stride):
-                z = float(depth_m[v, u])
-                if not (min_z < z < max_z):
-                    continue
-                Xd = (u - cx_d) * z / fx_d
-                Yd = (v - cy_d) * z / fy_d
-                Pc = R @ np.array([Xd, Yd, z], dtype=np.float32) + t
-                Zc = float(Pc[2])
-                if Zc <= 0.0:
-                    continue
-                up = int(round(fx_c * (float(Pc[0]) / Zc) + cx_c))
-                vp = int(round(fy_c * (float(Pc[1]) / Zc) + cy_c))
-                if up < 0 or up >= Wc or vp < 0 or vp >= Hc:
-                    continue
-                if mask[vp, up] == 0:
-                    continue
-                points_color.append(Pc)
-
-        self.get_logger().info(f"points found: {len(points_color)}")
-        if len(points_color) < min_pts:
-            self.get_logger().info(f'Not enough masked points: {len(points_color)}')
-            return None
-
-        return np.median(np.stack(points_color, axis=0), axis=0)
-
-    # ── TF transform ───────────────────────────────────────────────────────────
-
-    def _transform_to_base(self, point_cam):
-        cam_frame = self.color_frame_id or self.get_parameter('color_optical_frame').value
-        base_frame = self.get_parameter('base_frame').value
-        tf_timeout = float(self.get_parameter('tf_timeout_s').value)
-
-        ps = PointStamped()
-        ps.header.stamp = self.get_clock().now().to_msg()
-        ps.header.frame_id = cam_frame
-        ps.point.x = float(point_cam[0])
-        ps.point.y = float(point_cam[1])
-        ps.point.z = float(point_cam[2])
-
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                base_frame, cam_frame,
-                rclpy.time.Time(),
-                timeout=Duration(seconds=tf_timeout),
+    def _check_position_safe(self, x, y, z) -> bool:
+        if x > MAX_X or abs(y) > MAX_Y:
+            self.get_logger().error(
+                f"Position out of safe XY range: x={x:.3f} y={y:.3f}"
             )
-            pb = tf2_geometry_msgs.do_transform_point(ps, tf)
-            return np.array([pb.point.x, pb.point.y, pb.point.z])
-        except Exception as e:
-            return None
+            return False
+        if z < MIN_Z or z > MAX_Z:
+            self.get_logger().error(f"Z out of safe range: z={z:.3f}")
+            return False
+        return True
 
-    # ── Publishers ─────────────────────────────────────────────────────────────
+    def _check_reachable(self, x, y, z) -> bool:
+        req = CheckReachability.Request()
+        req.target_pose.position.x = float(x)
+        req.target_pose.position.y = float(y)
+        req.target_pose.position.z = float(z)
+        req.target_pose.orientation.x = EE_QUAT[0]
+        req.target_pose.orientation.y = EE_QUAT[1]
+        req.target_pose.orientation.z = EE_QUAT[2]
+        req.target_pose.orientation.w = EE_QUAT[3]
 
-    def _publish_invalid(self):
+        future = self._check_reachability_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+
+        if future.result() is None:
+            self.get_logger().error("check_reachability: no response")
+            return False
+        res = future.result()
+        if not res.reachable:
+            self.get_logger().error(f"Target not reachable: {res.message}")
+            return False
+
+        self.get_logger().info(f"Reachability confirmed for x={x:.3f} y={y:.3f} z={z:.3f}")
+        return True
+
+    def _make_pose(self, x, y, z) -> PoseStamped:
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_link'
-        msg.pose.position.x = msg.pose.position.y = msg.pose.position.z = -1.0
-        self.bottle_pose_pub.publish(msg)
+        msg.header.frame_id = "base_link"
+        msg.pose.position.x = float(x)
+        msg.pose.position.y = float(y)
+        msg.pose.position.z = float(z)
+        msg.pose.orientation.x = EE_QUAT[0]
+        msg.pose.orientation.y = EE_QUAT[1]
+        msg.pose.orientation.z = EE_QUAT[2]
+        msg.pose.orientation.w = EE_QUAT[3]
+        return msg
 
-    def _publish_bottle_pose(self, xyz):
-        msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_link'
-        msg.pose.position.x = float(xyz[0])
-        msg.pose.position.y = float(xyz[1])
-        msg.pose.position.z = float(xyz[2])
-        msg.pose.orientation.w = 1.0
-        self.bottle_pose_pub.publish(msg)
+    # ── Movement ───────────────────────────────────────────────────────────────
 
-        pt = PointStamped()
-        pt.header = msg.header
-        pt.point = msg.pose.position
-        self.debug_pt_pub.publish(pt)
-        self.get_logger().info(f'Bottle: x={xyz[0]:.3f} y={xyz[1]:.3f} z={xyz[2]:.3f}')
+    def _move_to_xyz(self, x, y, z, check_force=False) -> bool:
+        if not self._check_position_safe(x, y, z):
+            return False
+        if not self._check_reachable(x, y, z):
+            return False
 
-    # ── Main loop ──────────────────────────────────────────────────────────────
+        self.get_logger().info(f"Moving to x={x:.3f} y={y:.3f} z={z:.3f}")
+        
+        pose = self._make_pose(x, y, z)
+        for _ in range(5):
+            self._cartesian_pose_pub.publish(pose)
+            time.sleep(0.05)
 
-    def _process_once(self):
-        if not self._detection_enabled:
+        time.sleep(MIN_MOVE_TIME_S)
+
+        deadline = time.monotonic() + PHASE_TIMEOUT_S
+        deadline = time.monotonic() + PHASE_TIMEOUT_S
+        while time.monotonic() < deadline:
+            time.sleep(POLL_RATE_S)
+
+            speed = self._get_ee_speed()
+            force = self._get_ee_force()
+
+
+            if check_force and force > FORCE_THRESHOLD:
+                self.get_logger().info(f"Contact detected ({force:.1f} N)")
+                return True
+
+            if speed is not None and speed < SPEED_THRESHOLD:
+                self.get_logger().info(f"Arm settled (speed={speed:.4f} m/s)")
+                return True
+
+        self.get_logger().warn(f"Move timed out after {PHASE_TIMEOUT_S}s — continuing")
+        return True
+
+    # ── Pick sequence ──────────────────────────────────────────────────────────
+
+    def _go_home(self):
+        """Send arm to RAMMP home preset — no mode change needed."""
+        self.get_logger().info("Returning to home...")
+
+        if not self._reach_preset_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error("reach_preset action server not available")
             return
 
-        if self.latest_rgb is None:
-            self.get_logger().debug('Waiting for RGB...')
-            self._publish_invalid()
-            return
-        if self.latest_depth_m is None:
-            self.get_logger().debug('Waiting for depth...')
-            self._publish_invalid()
-            return
+        goal = ReachPreset.Goal()
+        goal.preset = ReachPreset.Goal.PRESET_HOME
+        send_future = self._reach_preset_client.send_goal_async(goal)
 
-        detections = self._run_yolo(self.latest_rgb)
-        if detections is None or detections[0] is None:
-            self.get_logger().debug('No bottle detected')
-            self._publish_invalid()
+        deadline = time.time() + 5.0
+        while not send_future.done() and time.time() < deadline:
+            time.sleep(0.05)
+
+        goal_handle = send_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            self.get_logger().error("Home goal rejected")
             return
 
-        # Get 3D centroid for each detection, pick nearest to base (0,0,0)
-        BOTTLE_HEIGHT_M = 0.25
-        best_centroid = None
-        best_dist = float('inf')
+        self.get_logger().info("Homing — waiting for completion...")
+        result_future = goal_handle.get_result_async()
+        deadline = time.time() + 30.0
+        while not result_future.done() and time.time() < deadline:
+            time.sleep(0.05)
+        self.get_logger().info("Home complete")
 
-        for mask, bbox, conf, bottom_cut_fraction in detections:
-            centroid_cam = self._get_centroid_from_depth(mask, bbox)
-            if centroid_cam is None:
+    def _reset_detector(self):
+        """Reset the bottle detector for a fresh stable reading."""
+        self.get_logger().info("Resetting detector for fresh reading...")
+        req_off = SetBool.Request()
+        req_off.data = False
+        future = self._detection_enable_client.call_async(req_off)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        time.sleep(1.0)
+        req_on = SetBool.Request()
+        req_on.data = True
+        future = self._detection_enable_client.call_async(req_on)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        self.get_logger().info("Detector reset — waiting for stable reading...")
+        time.sleep(3.0)
+
+    def pick(self) -> bool:
+        self.get_logger().info("=== PICK SEQUENCE START ===")
+
+        if not self._wait_for_services():
+            return False
+
+        # Reset detector for fresh stable reading
+        self._reset_detector()
+
+        # Validate bottle pose
+        pose = self.latest_bottle_pose
+        if pose is None:
+            self.get_logger().error("ABORT: No bottle pose received")
+            return False
+
+        if self._latest_pose_time is not None:
+            age = (self.get_clock().now() - self._latest_pose_time).nanoseconds / 1e9
+            if age > POSE_MAX_AGE_S:
+                self.get_logger().error(f"ABORT: Pose stale ({age:.1f}s)")
+                return False
+
+        x = pose.pose.position.x
+        y = pose.pose.position.y
+        z = pose.pose.position.z
+
+        if x == -1.0 and y == -1.0 and z == -1.0:
+            self.get_logger().error("ABORT: Detector has no valid bottle detection")
+            return False
+
+        self.get_logger().info(f"[STEP 0] Bottle at x={x:.3f} y={y:.3f} z={z:.3f}")
+
+        # Step 1: open gripper
+        self.get_logger().info("[STEP 1] Opening gripper")
+        if not self._open_gripper():
+            self.get_logger().error("ABORT: Could not open gripper")
+            return False
+
+        # Step 3: approach above bottle
+        self.get_logger().info("[STEP 3] Approaching above bottle")
+        if not self._move_to_xyz(x, y, z + APPROACH_HEIGHT):
+            self.get_logger().error("ABORT: Approach failed")
+            return False
+
+        # Step 4: descend to grasp with contact detection
+        self.get_logger().info("[STEP 4] Descending to grasp")
+        if not self._move_to_xyz(x, y, z + GRASP_Z_OFFSET, check_force=True):
+            self.get_logger().error("ABORT: Grasp descent failed")
+            return False
+
+        # Step 5: close gripper
+        # Step 5: close gripper
+        self.get_logger().info("[STEP 5] Closing gripper")
+        if not self._partial_close_gripper(0.41):
+            self.get_logger().error("ABORT: Could not close gripper")
+            return False
+
+        # Step 6: return to home
+        self.get_logger().info("[STEP 6] Returning to home")
+        self._go_home()
+
+        # Step 7: wait for input then move to handoff and release
+        self.get_logger().info("[STEP 7] Press ENTER to release bottle...")
+        input()
+        self.get_logger().info("[STEP 7] Moving to handoff position")
+        self._move_to_xyz(HANDOFF_X, HANDOFF_Y, HANDOFF_Z)
+        self.get_logger().info("[STEP 7] Waiting for arm to settle...")
+        time.sleep(MIN_MOVE_TIME_S)
+        deadline = time.monotonic() + PHASE_TIMEOUT_S
+        while time.monotonic() < deadline:
+            time.sleep(POLL_RATE_S)
+            speed = self._get_ee_speed()
+            if speed is not None and speed < SPEED_THRESHOLD:
+                break
+        self.get_logger().info("[STEP 7] Releasing bottle")
+        self._open_gripper()
+        self.get_logger().info("[STEP 8] Returning to home...")
+        self._go_home()
+        self.get_logger().info("=== PICK COMPLETE ===")
+        return True
+
+
+    def _bottle_detected(self) -> bool:
+        """Return True if detector is publishing a valid non-sentinel pose."""
+        if self.latest_bottle_pose is None:
+            return False
+        if self._latest_pose_time is None:
+            return False
+        age = (self.get_clock().now() - self._latest_pose_time).nanoseconds / 1e9
+        if age > POSE_MAX_AGE_S:
+            return False
+        p = self.latest_bottle_pose.pose.position
+        if p.x == -1.0 and p.y == -1.0 and p.z == -1.0:
+            return False
+        return True
+
+    def scan_and_pick(self) -> bool:
+        """Slowly sweep camera from top-left to bottom-right looking for bottle.
+
+        Generates a dense grid of waypoints and moves slowly through them,
+        checking for bottle detection at each step.
+        Stops immediately when bottle is found and triggers pick.
+        """
+        if not self._wait_for_services():
+            return False
+
+        self.get_logger().info("=== SCAN START ===")
+
+        # Reset detector for fresh reading
+        self._reset_detector()
+
+        # Check if bottle already visible before sweeping
+        if self._bottle_detected():
+            self.get_logger().info("Bottle already in frame — skipping sweep")
+            return self.pick()
+
+        # Diagonal sweep from top-left to bottom-right
+        import numpy as np
+        x_fixed = 0.50
+        n_steps = 12
+        y_vals = np.linspace(-0.35, 0.35, n_steps)   # left to right
+        z_vals = np.linspace(0.50, 0.25, n_steps)     # top to bottom
+
+        STEP_WAIT_S = 3.0  # seconds to hold each pose — long enough for YOLO
+
+        scan_poses = [(x_fixed, float(y), float(z)) for y, z in zip(y_vals, z_vals)]
+
+        total = len(scan_poses)
+        for i, (sx, sy, sz) in enumerate(scan_poses):
+            self.get_logger().info(f"Scan {i+1}/{total}: x={sx:.2f} y={sy:.2f} z={sz:.2f}")
+
+            if not self._check_position_safe(sx, sy, sz):
                 continue
-            centroid_base = self._transform_to_base(centroid_cam)
-            if centroid_base is None:
+            if not self._check_reachable(sx, sy, sz):
                 continue
 
-            if bottom_cut_fraction > 0.0:
-                z_shift = -bottom_cut_fraction * BOTTLE_HEIGHT_M * 0.5
-                centroid_base[2] += z_shift
-                self.get_logger().info(f'Applied z correction: {z_shift:.3f}m')
+            # Move to pose
+            pose = self._make_pose(sx, sy, sz)
+            for _ in range(5):
+                self._cartesian_pose_pub.publish(pose)
+                time.sleep(0.05)
 
-            dist = float(np.linalg.norm(centroid_base))
-            self.get_logger().info(f'Bottle candidate at x={centroid_base[0]:.3f} y={centroid_base[1]:.3f} z={centroid_base[2]:.3f} dist={dist:.3f}m')
-            if dist < best_dist:
-                best_dist = dist
-                best_centroid = centroid_base
+            # Wait for arm to settle
+            time.sleep(MIN_MOVE_TIME_S)
 
-        if best_centroid is None:
-            self._publish_invalid()
-            return
+            # Hold pose and check for detection every 0.2s
+            deadline = time.monotonic() + STEP_WAIT_S
+            while time.monotonic() < deadline:
+                time.sleep(0.2)
+                if self._bottle_detected():
+                    self.get_logger().info("Bottle detected! Stopping sweep and picking")
+                    return self.pick()
 
-        if len(detections) > 1:
-            self.get_logger().info(f'Multiple bottles detected — picking nearest at dist={best_dist:.3f}m')
-
-        self._pose_filter.update(best_centroid)
-        if not self._pose_filter.is_stable:
-            self.get_logger().debug('Filter warming up...')
-            self._publish_invalid()
-            return
-
-        self._publish_bottle_pose(self._pose_filter.xyz)
+        self.get_logger().error("=== SCAN COMPLETE — No bottle found ===")
+        return False
 
 
 def main():
     rclpy.init()
-    node = BottleDetector()
+    node = BottlePickController()
+
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
+    print("Waiting 5s for bottle pose...")
+    time.sleep(5.0)
+
     try:
-        from rclpy.executors import MultiThreadedExecutor
-        executor = MultiThreadedExecutor()
-        executor.add_node(node)
-        executor.spin()
+        success = node.pick()
+        if not success:
+            node.get_logger().error("Pick sequence failed")
     except KeyboardInterrupt:
-        pass
+        node.get_logger().warn("Interrupted")
+    except Exception as e:
+        node.get_logger().error(f"Unexpected error: {e}")
     finally:
-        node.destroy_node()
         rclpy.shutdown()
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+  main()
