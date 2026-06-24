@@ -45,16 +45,12 @@ import tf2_geometry_msgs
 import torch
 from ultralytics import YOLO
 from realsense2_camera_msgs.msg import Extrinsics
-from reachability_checker import ReachabilityChecker
 
 MODEL_PATH = '/home/cailyns/yolo11n-seg.pt'
-CONF_THRESHOLD = 0.25
+CONF_THRESHOLD = 0.50
 
 # How many pixels from the border counts as "touching"
 BORDER_MARGIN_PX = 5
-
-# Must match bottle_pick_controller.py
-EE_QUAT = [0.505, 0.628, 0.389, 0.447]  # [x, y, z, w]
 
 
 def depth_to_meters(depth_cv: np.ndarray) -> np.ndarray:
@@ -128,10 +124,10 @@ class BottleDetector(Node):
             min_samples=int(self.get_parameter('filter_min_samples').value),
         )
 
+        from rclpy.callback_groups import ReentrantCallbackGroup
+        self._cb_group = ReentrantCallbackGroup()
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-
-        self._reachability_checker = ReachabilityChecker(self, EE_QUAT)
 
         self.bottle_pose_pub = self.create_publisher(PoseStamped, '/arm/bottle/pose', 10)
         self.debug_pt_pub = self.create_publisher(PointStamped, '/bottle/debug_point_base', 10)
@@ -139,16 +135,16 @@ class BottleDetector(Node):
         self.create_service(SetBool, '/arm/bottle/detection/enable', self._srv_detection_enable)
 
         self.create_subscription(
-            Image, self.get_parameter('rgb_topic').value, self._cb_rgb, qos_profile_sensor_data
+            Image, self.get_parameter('rgb_topic').value, self._cb_rgb, qos_profile_sensor_data, callback_group=self._cb_group
         )
         self.create_subscription(
-            Image, self.get_parameter('depth_topic').value, self._cb_depth, qos_profile_sensor_data
+            Image, self.get_parameter('depth_topic').value, self._cb_depth, qos_profile_sensor_data, callback_group=self._cb_group
         )
         self.create_subscription(
-            CameraInfo, self.get_parameter('color_info_topic').value, self._cb_color_info, 10
+            CameraInfo, self.get_parameter('color_info_topic').value, self._cb_color_info, 10, callback_group=self._cb_group
         )
         self.create_subscription(
-            CameraInfo, self.get_parameter('depth_info_topic').value, self._cb_depth_info, 10
+            CameraInfo, self.get_parameter('depth_info_topic').value, self._cb_depth_info, 10, callback_group=self._cb_group
         )
 
         qos_extr = QoSProfile(
@@ -157,11 +153,11 @@ class BottleDetector(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.create_subscription(
-            Extrinsics, self.get_parameter('extrinsics_topic').value, self._cb_extrinsics, qos_extr
+            Extrinsics, self.get_parameter('extrinsics_topic').value, self._cb_extrinsics, qos_extr, callback_group=self._cb_group
         )
 
         rate = float(self.get_parameter('process_rate_hz').value)
-        self.create_timer(1.0 / max(rate, 0.1), self._process_once)
+        self.create_timer(1.0 / max(rate, 0.1), self._process_once, callback_group=self._cb_group)
 
         self.get_logger().info('BottleDetector started — YOLO not loaded yet')
         self.get_logger().info('Call /arm/bottle/detection/enable (True) to start')
@@ -262,8 +258,6 @@ class BottleDetector(Node):
                 img,
                 conf=float(self.get_parameter('detection_confidence').value),
                 verbose=False,
-                imgsz=320,
-                classes=[39],
                 device=self.yolo_device,
             )
         except Exception as e:
@@ -305,6 +299,7 @@ class BottleDetector(Node):
         touches_left   = mask[:, :BORDER_MARGIN_PX].any()
         touches_right  = mask[:, -BORDER_MARGIN_PX:].any()
         touches_bottom = mask[-BORDER_MARGIN_PX:, :].any()
+        self.get_logger().info(f'mask touches: top={touches_top} left={touches_left} right={touches_right} bottom={touches_bottom}')
 
         # Reject if touches top, left, or right — can't estimate correction
         if touches_top or touches_left or touches_right:
@@ -321,6 +316,8 @@ class BottleDetector(Node):
                 visible_height = mask_bottom_px - mask_top_px
 
                 if visible_height > 0:
+                    # Assume bottle is symmetric — estimate true bottom by mirroring
+                    # the visible portion below the detected bottom
                     estimated_true_bottom = 2.0 * mask_bottom_px - mask_top_px
                     pixels_below = max(0.0, estimated_true_bottom - (h - 1))
                     estimated_true_height = visible_height + pixels_below
@@ -389,8 +386,9 @@ class BottleDetector(Node):
                     continue
                 points_color.append(Pc)
 
+        self.get_logger().info(f"points found: {len(points_color)}")
         if len(points_color) < min_pts:
-            self.get_logger().debug(f'Not enough masked points: {len(points_color)}')
+            self.get_logger().info(f'Not enough masked points: {len(points_color)}')
             return None
 
         return np.median(np.stack(points_color, axis=0), axis=0)
@@ -418,7 +416,6 @@ class BottleDetector(Node):
             pb = tf2_geometry_msgs.do_transform_point(ps, tf)
             return np.array([pb.point.x, pb.point.y, pb.point.z])
         except Exception as e:
-            self.get_logger().debug(f'TF failed: {e}')
             return None
 
     # ── Publishers ─────────────────────────────────────────────────────────────
@@ -461,54 +458,60 @@ class BottleDetector(Node):
             self._publish_invalid()
             return
 
-        mask, bbox, conf, bottom_cut_fraction = self._run_yolo(self.latest_rgb)
-        if mask is None:
+        detections = self._run_yolo(self.latest_rgb)
+        if detections is None or detections[0] is None:
             self.get_logger().debug('No bottle detected')
             self._publish_invalid()
             return
 
-        self.get_logger().debug(f'Detected conf={conf:.2f}')
-
-        centroid_cam = self._get_centroid_from_depth(mask, bbox)
-        if centroid_cam is None:
-            self._publish_invalid()
-            return
-
-        centroid_base = self._transform_to_base(centroid_cam)
-        if centroid_base is None:
-            self._publish_invalid()
-            return
-
-        # If bottle is partially below frame, shift the centroid down
+        # Get 3D centroid for each detection, pick nearest to base (0,0,0)
         BOTTLE_HEIGHT_M = 0.25
-        if bottom_cut_fraction > 0.0:
-            z_shift = -bottom_cut_fraction * BOTTLE_HEIGHT_M * 0.5
-            centroid_base[2] += z_shift
-            self.get_logger().info(f'Applied z correction: {z_shift:.3f}m')
+        best_centroid = None
+        best_dist = float('inf')
 
-        self._pose_filter.update(centroid_base)
+        for mask, bbox, conf, bottom_cut_fraction in detections:
+            centroid_cam = self._get_centroid_from_depth(mask, bbox)
+            if centroid_cam is None:
+                continue
+            centroid_base = self._transform_to_base(centroid_cam)
+            if centroid_base is None:
+                continue
+
+            if bottom_cut_fraction > 0.0:
+                z_shift = -bottom_cut_fraction * BOTTLE_HEIGHT_M * 0.5
+                centroid_base[2] += z_shift
+                self.get_logger().info(f'Applied z correction: {z_shift:.3f}m')
+
+            dist = float(np.linalg.norm(centroid_base))
+            self.get_logger().info(f'Bottle candidate at x={centroid_base[0]:.3f} y={centroid_base[1]:.3f} z={centroid_base[2]:.3f} dist={dist:.3f}m')
+            if dist < best_dist:
+                best_dist = dist
+                best_centroid = centroid_base
+
+        if best_centroid is None:
+            self._publish_invalid()
+            return
+
+        if len(detections) > 1:
+            self.get_logger().info(f'Multiple bottles detected — picking nearest at dist={best_dist:.3f}m')
+
+        self._pose_filter.update(best_centroid)
         if not self._pose_filter.is_stable:
             self.get_logger().debug('Filter warming up...')
             self._publish_invalid()
             return
 
-        # Fire async reachability check — result available next cycle
-        filtered_xyz = self._pose_filter.xyz
-        self._reachability_checker.check_async(filtered_xyz)
-
-        if not self._reachability_checker.is_reachable:
-            self.get_logger().debug('Bottle not reachable — publishing invalid')
-            self._publish_invalid()
-            return
-
-        self._publish_bottle_pose(filtered_xyz)
+        self._publish_bottle_pose(self._pose_filter.xyz)
 
 
 def main():
     rclpy.init()
     node = BottleDetector()
     try:
-        rclpy.spin(node)
+        from rclpy.executors import MultiThreadedExecutor
+        executor = MultiThreadedExecutor()
+        executor.add_node(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
