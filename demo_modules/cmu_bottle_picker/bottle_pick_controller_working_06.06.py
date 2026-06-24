@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Bottle pick controller for RAMMP demo.
 
@@ -20,46 +19,36 @@ import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.action import ActionClient
 
 from geometry_msgs.msg import PoseStamped, TwistStamped, Vector3Stamped
 from std_srvs.srv import Trigger, SetBool
 
 from arm_interfaces.srv import CheckReachability
 from arm_interfaces.action import ReachPreset
-
-# Direct Kortex imports for partial gripper control
-try:
-    from kortex_api.TCPTransport import TCPTransport
-    from kortex_api.RouterClient import RouterClient
-    from kortex_api.SessionManager import SessionManager
-    from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
-    from kortex_api.autogen.messages import Session_pb2, Base_pb2
-except ModuleNotFoundError:
-    pass
+from rclpy.action import ActionClient
 
 # ── Pick geometry ──────────────────────────────────────────────────────────────
 APPROACH_HEIGHT = 0.12   # m above bottle centroid for pre-grasp approach
-GRASP_Z_OFFSET  = 0.02   # m above bottle centroid for grasp
+GRASP_Z_OFFSET  = 0.02
+
+# Handoff position — tune for demo
+HANDOFF_X = 0.7
+HANDOFF_Y = 0.0
+HANDOFF_Z = 0.55   # m above bottle centroid for grasp
 
 # Natural EE orientation when arm reaches toward the bottle
 EE_QUAT = [0.505, 0.628, 0.389, 0.447]  # [x, y, z, w]
 
 # ── Safety limits ──────────────────────────────────────────────────────────────
-MAX_X =  1.2
+MAX_X =  1.0
 MAX_Y =  0.5
 MAX_Z =  0.8
 MIN_Z = -0.5
 
-# ── Handoff position ───────────────────────────────────────────────────────────
-HANDOFF_X = 0.7
-HANDOFF_Y = 0.0
-HANDOFF_Z = 0.55
-
 # ── Motion parameters ─────────────────────────────────────────────────────────
-PHASE_TIMEOUT_S  =  4.0   # max seconds per move
-MIN_MOVE_TIME_S  =  3.0   # wait this long before checking if arm settled
-SPEED_THRESHOLD  =  0.12  # m/s — EE considered stopped below this
+PHASE_TIMEOUT_S  = 4  # max seconds per move
+MIN_MOVE_TIME_S  =  3  # wait this long before checking if arm settled
+SPEED_THRESHOLD  =  0.12 # m/s — EE considered stopped below this
 FORCE_THRESHOLD  = 15.0   # N — contact detection during descent
 POLL_RATE_S      =  0.05  # seconds between polls
 
@@ -80,6 +69,7 @@ class BottlePickController(Node):
         self._detection_enable_client = self.create_client(
             SetBool, "/arm/bottle/detection/enable", callback_group=self._cb_group
         )
+
         self._open_gripper_client = self.create_client(
             Trigger, "/arm/open_gripper", callback_group=self._cb_group
         )
@@ -88,11 +78,6 @@ class BottlePickController(Node):
         )
         self._check_reachability_client = self.create_client(
             CheckReachability, "/arm/check_reachability", callback_group=self._cb_group
-        )
-
-        # ── Action client for homing ───────────────────────────────────────────
-        self._reach_preset_client = ActionClient(
-            self, ReachPreset, "/arm/reach_preset", callback_group=self._cb_group
         )
 
         # ── Publishers ─────────────────────────────────────────────────────────
@@ -115,6 +100,10 @@ class BottlePickController(Node):
         self._latest_pose_time = None
         self.create_subscription(
             PoseStamped, "/arm/bottle/pose", self._cb_bottle_pose, 10
+        )
+
+        self._reach_preset_client = ActionClient(
+            self, ReachPreset, "/arm/reach_preset", callback_group=self._cb_group
         )
 
         self.get_logger().info("BottlePickController ready")
@@ -183,13 +172,19 @@ class BottlePickController(Node):
             time.sleep(1.5)
         return ok
 
-    def _partial_close_gripper(self, value=0.41) -> bool:
+
+    def _partial_close_gripper(self, value=0.6) -> bool:
         """Close gripper to a partial position via direct Kortex command.
 
         Args:
-            value: Gripper position 0.0 (open) to 1.0 (fully closed). Default 0.41.
+            value: Gripper position 0.0 (open) to 1.0 (fully closed). Default 0.6.
         """
         try:
+            from kortex_api.TCPTransport import TCPTransport
+            from kortex_api.RouterClient import RouterClient
+            from kortex_api.SessionManager import SessionManager
+            from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
+            from kortex_api.autogen.messages import Session_pb2, Base_pb2
             transport = TCPTransport()
             transport.connect('192.168.1.10', 10000)
             router = RouterClient(transport, lambda kx: None)
@@ -202,7 +197,6 @@ class BottlePickController(Node):
             cmd = Base_pb2.GripperCommand()
             cmd.mode = Base_pb2.GRIPPER_POSITION
             finger = cmd.gripper.finger.add()
-            finger.finger_identifier = 1
             finger.value = float(value)
             base.SendGripperCommand(cmd)
             time.sleep(1.5)
@@ -213,21 +207,6 @@ class BottlePickController(Node):
         except Exception as e:
             self.get_logger().error(f"partial_close_gripper failed: {e}")
             return False
-
-    def _reset_detector(self):
-        """Reset the bottle detector for a fresh stable reading."""
-        self.get_logger().info("Resetting detector for fresh reading...")
-        req_off = SetBool.Request()
-        req_off.data = False
-        future = self._detection_enable_client.call_async(req_off)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
-        time.sleep(1.0)
-        req_on = SetBool.Request()
-        req_on.data = True
-        future = self._detection_enable_client.call_async(req_on)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
-        self.get_logger().info("Detector reset — waiting for stable reading...")
-        time.sleep(3.0)
 
     def _check_position_safe(self, x, y, z) -> bool:
         if x > MAX_X or abs(y) > MAX_Y:
@@ -286,7 +265,7 @@ class BottlePickController(Node):
             return False
 
         self.get_logger().info(f"Moving to x={x:.3f} y={y:.3f} z={z:.3f}")
-
+        
         pose = self._make_pose(x, y, z)
         for _ in range(5):
             self._cartesian_pose_pub.publish(pose)
@@ -295,11 +274,13 @@ class BottlePickController(Node):
         time.sleep(MIN_MOVE_TIME_S)
 
         deadline = time.monotonic() + PHASE_TIMEOUT_S
+        deadline = time.monotonic() + PHASE_TIMEOUT_S
         while time.monotonic() < deadline:
             time.sleep(POLL_RATE_S)
 
             speed = self._get_ee_speed()
             force = self._get_ee_force()
+
 
             if check_force and force > FORCE_THRESHOLD:
                 self.get_logger().info(f"Contact detected ({force:.1f} N)")
@@ -312,10 +293,10 @@ class BottlePickController(Node):
         self.get_logger().warn(f"Move timed out after {PHASE_TIMEOUT_S}s — continuing")
         return True
 
-    # ── Home ───────────────────────────────────────────────────────────────────
+    # ── Pick sequence ──────────────────────────────────────────────────────────
 
     def _go_home(self):
-        """Send arm to RAMMP home preset."""
+        """Send arm to RAMMP home preset — no mode change needed."""
         self.get_logger().info("Returning to home...")
 
         if not self._reach_preset_client.wait_for_server(timeout_sec=5.0):
@@ -342,7 +323,20 @@ class BottlePickController(Node):
             time.sleep(0.05)
         self.get_logger().info("Home complete")
 
-    # ── Pick sequence ──────────────────────────────────────────────────────────
+    def _reset_detector(self):
+        """Reset the bottle detector for a fresh stable reading."""
+        self.get_logger().info("Resetting detector for fresh reading...")
+        req_off = SetBool.Request()
+        req_off.data = False
+        future = self._detection_enable_client.call_async(req_off)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        time.sleep(1.0)
+        req_on = SetBool.Request()
+        req_on.data = True
+        future = self._detection_enable_client.call_async(req_on)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        self.get_logger().info("Detector reset — waiting for stable reading...")
+        time.sleep(3.0)
 
     def pick(self) -> bool:
         self.get_logger().info("=== PICK SEQUENCE START ===")
@@ -381,35 +375,34 @@ class BottlePickController(Node):
             self.get_logger().error("ABORT: Could not open gripper")
             return False
 
-        # Step 2: approach above bottle
-        self.get_logger().info("[STEP 2] Approaching above bottle")
+        # Step 3: approach above bottle
+        self.get_logger().info("[STEP 3] Approaching above bottle")
         if not self._move_to_xyz(x, y, z + APPROACH_HEIGHT):
             self.get_logger().error("ABORT: Approach failed")
             return False
 
-        # Step 3: descend to grasp with contact detection
-        self.get_logger().info("[STEP 3] Descending to grasp")
+        # Step 4: descend to grasp with contact detection
+        self.get_logger().info("[STEP 4] Descending to grasp")
         if not self._move_to_xyz(x, y, z + GRASP_Z_OFFSET, check_force=True):
             self.get_logger().error("ABORT: Grasp descent failed")
             return False
 
-        # Step 4: partial close gripper (41% to avoid crushing bottle)
-        self.get_logger().info("[STEP 4] Closing gripper")
+        # Step 5: close gripper
+        # Step 5: close gripper
+        self.get_logger().info("[STEP 5] Closing gripper")
         if not self._partial_close_gripper(0.41):
             self.get_logger().error("ABORT: Could not close gripper")
             return False
 
-        # Step 5: return to home
-        self.get_logger().info("[STEP 5] Returning to home")
+        # Step 6: return to home
+        self.get_logger().info("[STEP 6] Returning to home")
         self._go_home()
 
-        # Step 6: wait for user input then move to handoff and release
-        self.get_logger().info("[STEP 6] Press ENTER to release bottle...")
+        # Step 7: wait for input then move to handoff and release
+        self.get_logger().info("[STEP 7] Press ENTER to release bottle...")
         input()
-        self.get_logger().info("[STEP 6] Moving to handoff position")
+        self.get_logger().info("[STEP 7] Moving to handoff position")
         self._move_to_xyz(HANDOFF_X, HANDOFF_Y, HANDOFF_Z)
-
-        # Wait for arm to settle before releasing
         self.get_logger().info("[STEP 7] Waiting for arm to settle...")
         time.sleep(MIN_MOVE_TIME_S)
         deadline = time.monotonic() + PHASE_TIMEOUT_S
@@ -418,12 +411,87 @@ class BottlePickController(Node):
             speed = self._get_ee_speed()
             if speed is not None and speed < SPEED_THRESHOLD:
                 break
-
         self.get_logger().info("[STEP 7] Releasing bottle")
         self._open_gripper()
-
+        self.get_logger().info("[STEP 8] Returning to home...")
+        self._go_home()
         self.get_logger().info("=== PICK COMPLETE ===")
         return True
+
+
+    def _bottle_detected(self) -> bool:
+        """Return True if detector is publishing a valid non-sentinel pose."""
+        if self.latest_bottle_pose is None:
+            return False
+        if self._latest_pose_time is None:
+            return False
+        age = (self.get_clock().now() - self._latest_pose_time).nanoseconds / 1e9
+        if age > POSE_MAX_AGE_S:
+            return False
+        p = self.latest_bottle_pose.pose.position
+        if p.x == -1.0 and p.y == -1.0 and p.z == -1.0:
+            return False
+        return True
+
+    def scan_and_pick(self) -> bool:
+        """Slowly sweep camera from top-left to bottom-right looking for bottle.
+
+        Generates a dense grid of waypoints and moves slowly through them,
+        checking for bottle detection at each step.
+        Stops immediately when bottle is found and triggers pick.
+        """
+        if not self._wait_for_services():
+            return False
+
+        self.get_logger().info("=== SCAN START ===")
+
+        # Reset detector for fresh reading
+        self._reset_detector()
+
+        # Check if bottle already visible before sweeping
+        if self._bottle_detected():
+            self.get_logger().info("Bottle already in frame — skipping sweep")
+            return self.pick()
+
+        # Diagonal sweep from top-left to bottom-right
+        import numpy as np
+        x_fixed = 0.50
+        n_steps = 12
+        y_vals = np.linspace(-0.35, 0.35, n_steps)   # left to right
+        z_vals = np.linspace(0.50, 0.25, n_steps)     # top to bottom
+
+        STEP_WAIT_S = 3.0  # seconds to hold each pose — long enough for YOLO
+
+        scan_poses = [(x_fixed, float(y), float(z)) for y, z in zip(y_vals, z_vals)]
+
+        total = len(scan_poses)
+        for i, (sx, sy, sz) in enumerate(scan_poses):
+            self.get_logger().info(f"Scan {i+1}/{total}: x={sx:.2f} y={sy:.2f} z={sz:.2f}")
+
+            if not self._check_position_safe(sx, sy, sz):
+                continue
+            if not self._check_reachable(sx, sy, sz):
+                continue
+
+            # Move to pose
+            pose = self._make_pose(sx, sy, sz)
+            for _ in range(5):
+                self._cartesian_pose_pub.publish(pose)
+                time.sleep(0.05)
+
+            # Wait for arm to settle
+            time.sleep(MIN_MOVE_TIME_S)
+
+            # Hold pose and check for detection every 0.2s
+            deadline = time.monotonic() + STEP_WAIT_S
+            while time.monotonic() < deadline:
+                time.sleep(0.2)
+                if self._bottle_detected():
+                    self.get_logger().info("Bottle detected! Stopping sweep and picking")
+                    return self.pick()
+
+        self.get_logger().error("=== SCAN COMPLETE — No bottle found ===")
+        return False
 
 
 def main():
@@ -435,6 +503,9 @@ def main():
 
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
+
+    print("Waiting 5s for bottle pose...")
+    time.sleep(5.0)
 
     try:
         success = node.pick()
@@ -449,4 +520,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+  main()
