@@ -1,4 +1,5 @@
 """
+06.25
 Bottle pick controller for RAMMP demo.
 
 Subscribes to /arm/bottle/pose from the bottle detector and executes
