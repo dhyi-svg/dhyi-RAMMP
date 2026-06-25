@@ -1,4 +1,5 @@
 """
+06.25
 Bottle detector node for RAMMP demo.
 
 Uses YOLO segmentation + depth image for 3D localization.
