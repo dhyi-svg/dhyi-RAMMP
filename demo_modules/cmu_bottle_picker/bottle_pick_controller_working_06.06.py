@@ -42,7 +42,7 @@ EE_QUAT = [0.505, 0.628, 0.389, 0.447]  # [x, y, z, w]
 # ── Safety limits ──────────────────────────────────────────────────────────────
 MAX_X =  1.0
 MAX_Y =  0.5
-MAX_Z =  0.8
+MAX_Z =  1.2
 MIN_Z = -0.5
 
 # ── Motion parameters ─────────────────────────────────────────────────────────
@@ -102,9 +102,7 @@ class BottlePickController(Node):
             PoseStamped, "/arm/bottle/pose", self._cb_bottle_pose, 10
         )
 
-        self._reach_preset_client = ActionClient(
-            self, ReachPreset, "/arm/reach_preset", callback_group=self._cb_group
-        )
+
 
         self.get_logger().info("BottlePickController ready")
 
@@ -150,7 +148,9 @@ class BottlePickController(Node):
 
     def _call_trigger(self, client, label: str) -> bool:
         future = client.call_async(Trigger.Request())
-        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        deadline = time.time() + 5.0
+        while not future.done() and time.time() < deadline:
+            time.sleep(0.05)
         if future.result() is None:
             self.get_logger().error(f"{label}: no response")
             return False
@@ -230,7 +230,9 @@ class BottlePickController(Node):
         req.target_pose.orientation.w = EE_QUAT[3]
 
         future = self._check_reachability_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        deadline = time.time() + 5.0
+        while not future.done() and time.time() < deadline:
+            time.sleep(0.05)
 
         if future.result() is None:
             self.get_logger().error("check_reachability: no response")
@@ -299,6 +301,8 @@ class BottlePickController(Node):
         """Send arm to RAMMP home preset — no mode change needed."""
         self.get_logger().info("Returning to home...")
 
+        if not hasattr(self, "_reach_preset_client") or self._reach_preset_client is None:
+            self._reach_preset_client = ActionClient(self, ReachPreset, "/arm/reach_preset", callback_group=self._cb_group)
         if not self._reach_preset_client.wait_for_server(timeout_sec=5.0):
             self.get_logger().error("reach_preset action server not available")
             return
@@ -329,14 +333,18 @@ class BottlePickController(Node):
         req_off = SetBool.Request()
         req_off.data = False
         future = self._detection_enable_client.call_async(req_off)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        deadline = time.time() + 5.0
+        while not future.done() and time.time() < deadline:
+            time.sleep(0.05)
         time.sleep(1.0)
         req_on = SetBool.Request()
         req_on.data = True
         future = self._detection_enable_client.call_async(req_on)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        deadline = time.time() + 5.0
+        while not future.done() and time.time() < deadline:
+            time.sleep(0.05)
         self.get_logger().info("Detector reset — waiting for stable reading...")
-        time.sleep(3.0)
+        time.sleep(5.0)
 
     def pick(self) -> bool:
         self.get_logger().info("=== PICK SEQUENCE START ===")
@@ -347,8 +355,18 @@ class BottlePickController(Node):
         # Reset detector for fresh stable reading
         self._reset_detector()
 
-        # Validate bottle pose
-        pose = self.latest_bottle_pose
+        # Validate bottle pose — retry up to 10s for YOLO warmup
+        pose = None
+        for _ in range(20):
+            pose = self.latest_bottle_pose
+            if pose is not None:
+                x = pose.pose.position.x
+                y = pose.pose.position.y
+                z = pose.pose.position.z
+                if not (x == -1.0 and y == -1.0 and z == -1.0):
+                    break
+            self.get_logger().info("Waiting for valid bottle detection...")
+            time.sleep(0.5)
         if pose is None:
             self.get_logger().error("ABORT: No bottle pose received")
             return False
@@ -368,6 +386,15 @@ class BottlePickController(Node):
             return False
 
         self.get_logger().info(f"[STEP 0] Bottle at x={x:.3f} y={y:.3f} z={z:.3f}")
+
+        # Pre-check both approach and grasp are reachable before moving
+        self.get_logger().info("[STEP 0] Pre-checking reachability...")
+        if not self._check_reachable(x, y, z + APPROACH_HEIGHT):
+            self.get_logger().error("ABORT: Approach position not reachable")
+            return False
+        if not self._check_reachable(x, y, z + GRASP_Z_OFFSET):
+            self.get_logger().error("ABORT: Grasp position not reachable — bottle too far or bad angle")
+            return False
 
         # Step 1: open gripper
         self.get_logger().info("[STEP 1] Opening gripper")
@@ -394,7 +421,11 @@ class BottlePickController(Node):
             self.get_logger().error("ABORT: Could not close gripper")
             return False
 
-        # Step 6: return to home
+        # Step 6: lift up, move back, then home
+        self.get_logger().info("[STEP 6] Lifting up")
+        self._move_to_xyz(x, y, z + APPROACH_HEIGHT)
+        self.get_logger().info("[STEP 6] Moving back to safe position")
+        self._move_to_xyz(0.4, y, z + APPROACH_HEIGHT)
         self.get_logger().info("[STEP 6] Returning to home")
         self._go_home()
 
@@ -503,9 +534,8 @@ def main():
 
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
-
-    print("Waiting 5s for bottle pose...")
-    time.sleep(5.0)
+    time.sleep(2.0)
+    print(f"Spin thread alive: {spin_thread.is_alive()}")
 
     try:
         success = node.pick()
@@ -520,4 +550,4 @@ def main():
 
 
 if __name__ == "__main__":
-  main()
+    main()
